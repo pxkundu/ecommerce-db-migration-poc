@@ -1,0 +1,47 @@
+name: CD Pipeline
+on:
+  push:
+    branches:
+      - main
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ./terraform/environments/dev
+      - name: Terraform Plan
+        run: terraform plan -out=tfplan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        working-directory: ./terraform/environments/dev
+      - name: Terraform Apply
+        run: terraform apply tfplan
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        working-directory: ./terraform/environments/dev
+      - name: Set up Flyway
+        uses: flyway/flyway-action@v5
+        with:
+          version: 9.22.3
+      - name: Flyway Migrate (On-Prem)
+        run: flyway migrate
+        env:
+          DB_HOST: ${{ secrets.ON_PREM_DB_HOST }}
+          DB_USER: ${{ secrets.ON_PREM_DB_USER }}
+          DB_PASSWORD: ${{ secrets.ON_PREM_DB_PASSWORD }}
+        working-directory: ./db
+      - name: Flyway Migrate (Aurora)
+        run: flyway migrate
+        env:
+          DB_HOST: ${{ secrets.AURORA_DB_HOST }}
+          DB_USER: ${{ secrets.AURORA_DB_USER }}
+          DB_PASSWORD: ${{ secrets.AURORA_DB_PASSWORD }}
+        working-directory: ./db

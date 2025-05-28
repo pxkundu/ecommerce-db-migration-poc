@@ -1,0 +1,34 @@
+name: CI Pipeline
+on:
+  pull_request:
+    branches:
+      - main
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+      - name: Terraform Format
+        run: terraform fmt -check -recursive
+        working-directory: ./terraform
+      - name: Terraform Init
+        run: terraform init
+        working-directory: ./terraform/environments/dev
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: ./terraform/environments/dev
+      - name: Set up Flyway
+        uses: flyway/flyway-action@v5
+        with:
+          version: 9.22.3
+      - name: Flyway Validate
+        run: flyway validate
+        env:
+          DB_HOST: ${{ secrets.ON_PREM_DB_HOST }}
+          DB_USER: ${{ secrets.ON_PREM_DB_USER }}
+          DB_PASSWORD: ${{ secrets.ON_PREM_DB_PASSWORD }}
+        working-directory: ./db
