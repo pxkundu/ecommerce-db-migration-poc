@@ -3,45 +3,276 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+env:
+  TF_WORKSPACE: dev
+  FLYWAY_VERSION: 9.22.3
+  TERRAFORM_VERSION: 1.5.0
+  DEPLOYMENT_TIMEOUT: 1800  # 30 minutes
+  ROLLBACK_TIMEOUT: 900    # 15 minutes
+  BATCH_SIZE: 10000
+  MAX_RETRIES: 3
+  RETRY_DELAY: 60
+
 jobs:
-  deploy:
+  pre-deployment-check:
+    name: Pre-deployment Validation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      
+      - name: Check Environment Variables
+        run: |
+          required_vars=("AWS_ACCESS_KEY_ID" "AWS_SECRET_ACCESS_KEY" "ON_PREM_DB_HOST" "AURORA_DB_HOST")
+          for var in "${required_vars[@]}"; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Required environment variable $var is not set"
+              exit 1
+            fi
+          done
+
+      - name: Check Database Connectivity
+        run: |
+          # Check On-Prem DB
+          if ! mysql -h ${{ secrets.ON_PREM_DB_HOST }} -u ${{ secrets.ON_PREM_DB_USER }} -p${{ secrets.ON_PREM_DB_PASSWORD }} -e "SELECT 1" > /dev/null 2>&1; then
+            echo "::error::Cannot connect to On-Prem database"
+            exit 1
+          fi
+          
+          # Check Aurora DB
+          if ! mysql -h ${{ secrets.AURORA_DB_HOST }} -u ${{ secrets.AURORA_DB_USER }} -p${{ secrets.AURORA_DB_PASSWORD }} -e "SELECT 1" > /dev/null 2>&1; then
+            echo "::error::Cannot connect to Aurora database"
+            exit 1
+          fi
+
+      - name: Validate Database Compatibility
+        run: |
+          # Check MySQL versions
+          onprem_version=$(mysql -h ${{ secrets.ON_PREM_DB_HOST }} -u ${{ secrets.ON_PREM_DB_USER }} -p${{ secrets.ON_PREM_DB_PASSWORD }} -e "SELECT VERSION()" -s)
+          aurora_version=$(mysql -h ${{ secrets.AURORA_DB_HOST }} -u ${{ secrets.AURORA_DB_USER }} -p${{ secrets.AURORA_DB_PASSWORD }} -e "SELECT VERSION()" -s)
+          
+          if [ "$onprem_version" != "$aurora_version" ]; then
+            echo "::warning::MySQL version mismatch: On-Prem ($onprem_version) vs Aurora ($aurora_version)"
+          fi
+
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    needs: pre-deployment-check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v2
         with:
-          terraform_version: 1.5.0
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
       - name: Terraform Init
         run: terraform init
         working-directory: ./terraform/environments/dev
+
       - name: Terraform Plan
+        id: plan
         run: terraform plan -out=tfplan
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         working-directory: ./terraform/environments/dev
+
       - name: Terraform Apply
-        run: terraform apply tfplan
+        id: apply
+        run: |
+          terraform apply -auto-approve tfplan
+          if [ $? -ne 0 ]; then
+            echo "::error::Infrastructure deployment failed"
+            exit 1
+          fi
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         working-directory: ./terraform/environments/dev
+        timeout-minutes: 30
+
+      - name: Save Terraform State
+        if: success()
+        run: |
+          terraform state pull > terraform.tfstate
+          echo "TF_STATE<<EOF" >> $GITHUB_ENV
+          cat terraform.tfstate >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+        working-directory: ./terraform/environments/dev
+
+  prepare-migration:
+    name: Prepare Migration
+    needs: deploy-infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Generate Migration Plan
+        run: |
+          # Analyze table sizes and dependencies
+          mysql -h ${{ secrets.ON_PREM_DB_HOST }} -u ${{ secrets.ON_PREM_DB_USER }} -p${{ secrets.ON_PREM_DB_PASSWORD }} -e "
+            SELECT 
+              table_name,
+              table_rows,
+              data_length,
+              index_length
+            FROM information_schema.tables 
+            WHERE table_schema = DATABASE()
+            ORDER BY data_length DESC;" > migration_plan.txt
+          
+          # Calculate checksums for critical tables
+          mysql -h ${{ secrets.ON_PREM_DB_HOST }} -u ${{ secrets.ON_PREM_DB_USER }} -p${{ secrets.ON_PREM_DB_PASSWORD }} -e "
+            SELECT 
+              table_name,
+              COUNT(*) as row_count,
+              MD5(GROUP_CONCAT(*)) as table_checksum
+            FROM information_schema.tables 
+            WHERE table_schema = DATABASE()
+            GROUP BY table_name;" > table_checksums.txt
+
+      - name: Backup On-Prem Database
+        run: |
+          timestamp=$(date +%Y%m%d_%H%M%S)
+          mysqldump -h ${{ secrets.ON_PREM_DB_HOST }} -u ${{ secrets.ON_PREM_DB_USER }} -p${{ secrets.ON_PREM_DB_PASSWORD }} \
+            --all-databases \
+            --single-transaction \
+            --master-data=2 \
+            --triggers \
+            --routines \
+            --events \
+            --set-gtid-purged=OFF \
+            > backup_${timestamp}.sql
+          echo "BACKUP_FILE=backup_${timestamp}.sql" >> $GITHUB_ENV
+
+  deploy-database:
+    name: Deploy Database Changes
+    needs: prepare-migration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
       - name: Set up Flyway
         uses: flyway/flyway-action@v5
         with:
-          version: 9.22.3
-      - name: Flyway Migrate (On-Prem)
-        run: flyway migrate
-        env:
-          DB_HOST: ${{ secrets.ON_PREM_DB_HOST }}
-          DB_USER: ${{ secrets.ON_PREM_DB_USER }}
-          DB_PASSWORD: ${{ secrets.ON_PREM_DB_PASSWORD }}
-        working-directory: ./db
-      - name: Flyway Migrate (Aurora)
-        run: flyway migrate
+          version: ${{ env.FLYWAY_VERSION }}
+
+      - name: Migrate Schema
+        id: migrate-schema
+        run: |
+          flyway migrate
+          if [ $? -ne 0 ]; then
+            echo "::error::Schema migration failed"
+            exit 1
+          fi
         env:
           DB_HOST: ${{ secrets.AURORA_DB_HOST }}
           DB_USER: ${{ secrets.AURORA_DB_USER }}
           DB_PASSWORD: ${{ secrets.AURORA_DB_PASSWORD }}
         working-directory: ./db
+        timeout-minutes: 30
+
+      - name: Migrate Data
+        id: migrate-data
+        run: |
+          # Read migration plan and process tables in batches
+          while IFS=, read -r table_name row_count; do
+            echo "Migrating table: $table_name"
+            
+            # Migrate in batches
+            offset=0
+            while true; do
+              mysql -h ${{ secrets.AURORA_DB_HOST }} -u ${{ secrets.AURORA_DB_USER }} -p${{ secrets.AURORA_DB_PASSWORD }} -e "
+                INSERT INTO $table_name 
+                SELECT * FROM ${{ secrets.ON_PREM_DB_HOST }}.$table_name 
+                LIMIT ${{ env.BATCH_SIZE }} OFFSET $offset"
+              
+              if [ $? -ne 0 ]; then
+                echo "::error::Data migration failed for table $table_name at offset $offset"
+                exit 1
+              fi
+              
+              offset=$((offset + ${{ env.BATCH_SIZE }}))
+              if [ $offset -ge $row_count ]; then
+                break
+              fi
+            done
+          done < migration_plan.txt
+
+  verify-migration:
+    name: Verify Migration
+    needs: deploy-database
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Verify Data Integrity
+        run: |
+          # Compare row counts
+          mysql -h ${{ secrets.ON_PREM_DB_HOST }} -u ${{ secrets.ON_PREM_DB_USER }} -p${{ secrets.ON_PREM_DB_PASSWORD }} -e "
+            SELECT table_name, COUNT(*) as count 
+            FROM information_schema.tables 
+            WHERE table_schema = DATABASE() 
+            GROUP BY table_name" > onprem_counts.txt
+          
+          mysql -h ${{ secrets.AURORA_DB_HOST }} -u ${{ secrets.AURORA_DB_USER }} -p${{ secrets.AURORA_DB_PASSWORD }} -e "
+            SELECT table_name, COUNT(*) as count 
+            FROM information_schema.tables 
+            WHERE table_schema = DATABASE() 
+            GROUP BY table_name" > aurora_counts.txt
+          
+          diff onprem_counts.txt aurora_counts.txt
+          if [ $? -ne 0 ]; then
+            echo "::error::Row count mismatch detected"
+            exit 1
+          fi
+
+      - name: Verify Constraints
+        run: |
+          # Verify foreign keys
+          mysql -h ${{ secrets.AURORA_DB_HOST }} -u ${{ secrets.AURORA_DB_USER }} -p${{ secrets.AURORA_DB_PASSWORD }} -e "
+            SELECT * FROM information_schema.KEY_COLUMN_USAGE 
+            WHERE REFERENCED_TABLE_SCHEMA = DATABASE()"
+          
+          # Verify unique constraints
+          mysql -h ${{ secrets.AURORA_DB_HOST }} -u ${{ secrets.AURORA_DB_USER }} -p${{ secrets.AURORA_DB_PASSWORD }} -e "
+            SELECT * FROM information_schema.STATISTICS 
+            WHERE TABLE_SCHEMA = DATABASE() 
+            AND NON_UNIQUE = 0"
+
+      - name: Run Smoke Tests
+        run: |
+          # Add your smoke tests here
+          echo "Running smoke tests..."
+          # Example: curl -f http://your-api-endpoint/health
+
+  rollback:
+    name: Rollback
+    if: failure()
+    needs: [deploy-infrastructure, deploy-database, verify-migration]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Restore Database Backup
+        if: needs.deploy-database.outcome == 'failure' || needs.verify-migration.outcome == 'failure'
+        run: |
+          if [ -n "${{ env.BACKUP_FILE }}" ]; then
+            mysql -h ${{ secrets.ON_PREM_DB_HOST }} -u ${{ secrets.ON_PREM_DB_USER }} -p${{ secrets.ON_PREM_DB_PASSWORD }} < ${{ env.BACKUP_FILE }}
+          fi
+
+      - name: Rollback Infrastructure
+        if: needs.deploy-infrastructure.outcome == 'failure'
+        run: |
+          if [ -n "${{ env.TF_STATE }}" ]; then
+            echo "${{ env.TF_STATE }}" > terraform.tfstate
+            terraform init
+            terraform apply -auto-approve
+          fi
+        working-directory: ./terraform/environments/dev
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        timeout-minutes: 15

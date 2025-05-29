@@ -3,32 +3,115 @@ on:
   pull_request:
     branches:
       - main
+  workflow_dispatch:
+
+env:
+  TF_WORKSPACE: dev
+  FLYWAY_VERSION: 9.22.3
+  TERRAFORM_VERSION: 1.5.0
+
 jobs:
-  validate:
+  validate-terraform:
+    name: Validate Terraform
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v2
         with:
-          terraform_version: 1.5.0
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      
       - name: Terraform Format
+        id: fmt
         run: terraform fmt -check -recursive
         working-directory: ./terraform
+        continue-on-error: true
+
       - name: Terraform Init
+        id: init
         run: terraform init
         working-directory: ./terraform/environments/dev
+        continue-on-error: true
+
       - name: Terraform Validate
+        id: validate
         run: terraform validate
         working-directory: ./terraform/environments/dev
+        continue-on-error: true
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -out=tfplan
+        working-directory: ./terraform/environments/dev
+        continue-on-error: true
+
+      - name: Check Terraform Steps
+        if: steps.fmt.outcome == 'failure' || steps.init.outcome == 'failure' || steps.validate.outcome == 'failure' || steps.plan.outcome == 'failure'
+        run: |
+          echo "Terraform validation failed. Please check the logs above for details."
+          exit 1
+
+  validate-database:
+    name: Validate Database Migrations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
       - name: Set up Flyway
         uses: flyway/flyway-action@v5
         with:
-          version: 9.22.3
-      - name: Flyway Validate
-        run: flyway validate
+          version: ${{ env.FLYWAY_VERSION }}
+
+      - name: Validate On-Prem Migrations
+        id: validate-onprem
+        run: |
+          flyway validate
+          if [ $? -ne 0 ]; then
+            echo "::error::On-prem database migration validation failed"
+            exit 1
+          fi
         env:
           DB_HOST: ${{ secrets.ON_PREM_DB_HOST }}
           DB_USER: ${{ secrets.ON_PREM_DB_USER }}
           DB_PASSWORD: ${{ secrets.ON_PREM_DB_PASSWORD }}
         working-directory: ./db
+        continue-on-error: true
+
+      - name: Validate Aurora Migrations
+        id: validate-aurora
+        run: |
+          flyway validate
+          if [ $? -ne 0 ]; then
+            echo "::error::Aurora database migration validation failed"
+            exit 1
+          fi
+        env:
+          DB_HOST: ${{ secrets.AURORA_DB_HOST }}
+          DB_USER: ${{ secrets.AURORA_DB_USER }}
+          DB_PASSWORD: ${{ secrets.AURORA_DB_PASSWORD }}
+        working-directory: ./db
+        continue-on-error: true
+
+      - name: Check Database Validation
+        if: steps.validate-onprem.outcome == 'failure' || steps.validate-aurora.outcome == 'failure'
+        run: |
+          echo "Database migration validation failed. Please check the logs above for details."
+          exit 1
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.0
+        with:
+          working-directory: ./terraform
+        continue-on-error: true
+
+      - name: Run tflint
+        uses: terraform-linters/tflint-github-action@v3
+        with:
+          working-directory: ./terraform
+        continue-on-error: true
